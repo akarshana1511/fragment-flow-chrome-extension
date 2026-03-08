@@ -52,4 +52,20 @@ document.addEventListener('DOMContentLoaded', () => {
             statusText.innerText = "Downloading segments...";
         }
     }
+
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+        if (message.action === "downloadInfo") {
+            if (message.supported) {
+                statusText.innerText = `Target locked: ${message.sizeMB} MB. Ready to split.`;
+                threadCount.innerText = message.threads;
+                statusText.classList.replace('text-muted', 'text-success');
+            } else {
+                statusText.innerText = "Server restricts multithreading. Using standard download.";
+                statusText.classList.replace('text-muted', 'text-warning');
+            }
+        } 
+        else if (message.action === "updateProgress") {
+            updateUI(message.percent, message.speed);
+        }
+    });
 });
