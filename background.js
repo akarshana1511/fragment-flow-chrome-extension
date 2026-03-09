@@ -1,88 +1,184 @@
+let chunkQueue = [];
+let results = [];
+let activeThreads = 4;
+
+function createChunks(totalBytes, chunkSize = 2 * 1024 * 1024) {
+
+    console.log("Creating chunks...");
+
+    let start = 0;
+
+    while (start < totalBytes) {
+
+        let end = Math.min(start + chunkSize - 1, totalBytes - 1);
+
+        chunkQueue.push({ start, end });
+
+        console.log("Chunk created:", start, "-", end);
+
+        start = end + 1;
+    }
+
+    console.log("Total chunks:", chunkQueue.length);
+}
+
+async function downloadWorker(url, id) {
+
+    console.log("Worker", id, "started");
+
+    while (chunkQueue.length > 0) {
+
+        const chunk = chunkQueue.shift();
+
+        if (!chunk) break;
+
+        console.log("Worker", id, "downloading", chunk.start, "-", chunk.end);
+
+        const response = await fetch(url, {
+            headers: {
+                Range: `bytes=${chunk.start}-${chunk.end}`
+            }
+        });
+
+        const blob = await response.blob();
+
+        console.log("Worker", id, "finished", chunk.start, "-", chunk.end);
+
+        results.push({
+            start: chunk.start,
+            data: blob
+        });
+    }
+
+    console.log("Worker", id, "finished all tasks");
+}
+
+async function startDownload(url, totalBytes) {
+
+    console.log("Starting multithread download");
+
+    chunkQueue = [];
+    results = [];
+
+    createChunks(totalBytes);
+
+    const workers = [];
+
+    for (let i = 0; i < activeThreads; i++) {
+
+        workers.push(downloadWorker(url, i));
+    }
+
+    await Promise.all(workers);
+
+    console.log("All workers completed");
+
+    mergeChunks();
+}
+
+async function mergeChunks() {
+
+    console.log("Merging chunks...");
+
+    results.sort((a, b) => a.start - b.start);
+
+    const blobs = results.map(r => r.data);
+
+    const finalBlob = new Blob(blobs);
+
+    console.log("Final file size:", finalBlob.size);
+
+    const reader = new FileReader();
+
+    reader.onloadend = function () {
+
+        chrome.downloads.download({
+            url: reader.result,
+            filename: "fragment_download.bin",
+            saveAs: true
+        });
+
+        console.log("Download triggered successfully");
+
+    };
+
+    reader.readAsDataURL(finalBlob);
+}
 
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
-    console.log("Fragment Flow detected a new download:", downloadItem.url);
+    if (!downloadItem.url.startsWith("http")) {
+        console.log("Ignoring internal extension download");
+        return;
+    }
+    console.log("Fragment Flow detected download:", downloadItem.url);
 
-    // Pause the default Chrome download immediately
-    chrome.downloads.pause(downloadItem.id, () => {
-        console.log("Default download paused. Analyzing server capabilities...");
-    });
+    chrome.downloads.cancel(downloadItem.id);
 
     try {
-        // Attempt a HEAD request to check for multithreading support
-        const response = await fetch(downloadItem.url, { method: 'HEAD' });
-        
-        const acceptRanges = response.headers.get('Accept-Ranges');
-        const contentLength = response.headers.get('Content-Length');
 
-        if (acceptRanges === 'bytes' && contentLength) {
-            // Server explicitly allows splitting
-            const totalBytes = parseInt(contentLength, 10);
-            const sizeInMB = (totalBytes / (1024 * 1024)).toFixed(2);
-            const threads = 4;
-            const chunkSize = Math.floor(totalBytes / threads);
-            
-            console.log(`Success! File is ${sizeInMB} MB. Supports splitting.`);
-            console.log(`Allocating ${threads} threads at ~${chunkSize} bytes each.`);
-            
-            // Send data to the Popup UI
+        console.log("Checking file size...");
+
+        const response = await fetch(downloadItem.url, { method: "HEAD" });
+
+        const contentLength = response.headers.get("Content-Length");
+
+        if (contentLength) {
+
+            const totalBytes = parseInt(contentLength);
+
+            const sizeMB = (totalBytes / (1024 * 1024)).toFixed(2);
+
+            console.log("File size:", sizeMB, "MB");
+
+            console.log("Using", activeThreads, "threads");
+
             chrome.runtime.sendMessage({
                 action: "downloadInfo",
                 supported: true,
-                sizeMB: sizeInMB,
-                threads: threads
+                sizeMB: sizeMB,
+                threads: activeThreads
             }).catch(() => {});
 
-            // [DAY 3: Akarshana's chunk downloading code will go here]
+            startDownload(downloadItem.url, totalBytes);
 
         } else {
-            // Server actively refuses splitting
-            console.warn("Server does not support multithreading. Falling back to default.");
-            chrome.runtime.sendMessage({ action: "downloadInfo", supported: false }).catch(() => {});
-            chrome.downloads.resume(downloadItem.id);
+
+            console.warn("Server did not return file size");
+
         }
 
-    } catch (error) {
+    } catch (err) {
 
-        console.warn("HEAD request blocked by server (CORS). Activating Smart Fallback...");
+        console.warn("HEAD request blocked, using fallback");
 
         if (downloadItem.totalBytes > 0) {
-            // Chrome already figured out the file size for us!
-            const sizeInMB = (downloadItem.totalBytes / (1024 * 1024)).toFixed(2);
-            const threads = 4;
-            const chunkSize = Math.floor(downloadItem.totalBytes / threads);
 
-            console.log(`Fallback Success! Chrome reports file is ${sizeInMB} MB.`);
-            console.log(`Ready to allocate ${threads} threads at ~${chunkSize} bytes each.`);
-
-            chrome.runtime.sendMessage({
-                action: "downloadInfo",
-                supported: true,
-                sizeMB: sizeInMB,
-                threads: threads
-            }).catch(() => {});
-
-            // [Akarshana's chunk downloading code will go here]
+            startDownload(downloadItem.url, downloadItem.totalBytes);
 
         } else {
-            // File size is entirely unknown (e.g., dynamic live stream file)
-            console.error("File size is completely unknown. Resuming standard Chrome download.");
-            chrome.runtime.sendMessage({ action: "downloadInfo", supported: false }).catch(() => {});
-            chrome.downloads.resume(downloadItem.id);
+
+            console.error("Unable to determine file size");
+
         }
     }
 });
 
-
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log("Message received from Popup:", message.action);
 
     if (message.action === "getStatus") {
-        sendResponse({ status: "Manager Active", threads: 4 });
-    } 
-    else if (message.action === "testConnection") {
-        console.log("Handshake successful. Communication bridge active.");
-        sendResponse({ success: true });
+
+        sendResponse({
+            status: "Manager Active",
+            threads: activeThreads
+        });
+
     }
 
-    return true; 
+    if (message.action === "testConnection") {
+
+        sendResponse({ success: true });
+
+    }
+
+    return true;
 });
