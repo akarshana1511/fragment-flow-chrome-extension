@@ -97,11 +97,27 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             }
         }
+        else if (message.action === "downloadComplete") {
+            statusBadge.innerText = "Downloaded";
+            statusBadge.className = "badge bg-success text-white";
+            actionBtn.style.display = 'none'; 
+            fileNameEl.innerText = "Download Complete!";
+            globalProgress.style.width = "100%";
+            globalPercentEl.innerText = "100%";
+            globalSpeedEl.innerText = "0 KB/s";
+        }
     });
 
     chrome.runtime.sendMessage({ action: "getStatus" }, (response) => {
         if (!chrome.runtime.lastError && response) {
-            if (response.isDownloading) {
+            if (response.downloadCompleted) {
+                statusBadge.innerText = "Downloaded";
+                statusBadge.className = "badge bg-success text-white";
+                actionBtn.style.display = 'none';
+                fileNameEl.innerText = "✓ Download Complete!";
+                globalProgress.style.width = "100%";
+                globalPercentEl.innerText = "100%";
+            } else if (response.isDownloading) {
                  actionBtn.style.display = 'inline-block';
                  if (response.isPaused) {
                      isPaused = true;

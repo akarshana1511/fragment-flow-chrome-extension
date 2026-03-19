@@ -10,7 +10,40 @@ let globalTotalBytes = 0;
 let startTime = 0;
 let isDownloading = false;
 let isPaused = false;
+let downloadCompleted = false;
 let currentTargetUrl = "";
+function calculateDynamicThreads(totalBytes) {
+    const MB = 1024 * 1024;
+    const sizeMB = totalBytes / MB;
+
+    let threads;
+
+    if (sizeMB < 5) {
+        threads = 1;
+    } else if (sizeMB < 50) {
+        threads = Math.min(4, Math.ceil(sizeMB / 15));
+    } else if (sizeMB < 200) {
+        threads = Math.min(8, Math.ceil(sizeMB / 25));
+    } else {
+        threads = Math.min(16, Math.ceil(sizeMB / 50));
+    }
+
+    // Safety limits
+    const MAX_THREADS = 16;
+    const MIN_THREADS = 1;
+
+    return Math.max(MIN_THREADS, Math.min(MAX_THREADS, threads));
+}
+
+function getDynamicChunkSize(totalBytes) {
+    const MB = 1024 * 1024;
+    const sizeMB = totalBytes / MB;
+
+    if (sizeMB < 50) return 1 * MB;
+    if (sizeMB < 200) return 2 * MB;
+    if (sizeMB < 1000) return 4 * MB;
+    return 8 * MB;
+}
 
 function createChunks(totalBytes, chunkSize = 2 * 1024 * 1024) {
     let start = 0;
@@ -137,6 +170,7 @@ async function startWorkers() {
 function initDownload(url, totalBytes) {
     isDownloading = true;
     isPaused = false;
+    downloadCompleted = false;
     currentTargetUrl = url;
     chunkQueue = [];
     results = [];
@@ -144,10 +178,13 @@ function initDownload(url, totalBytes) {
     globalDownloadedBytes = 0;
     globalTotalBytes = totalBytes;
 
-    createChunks(totalBytes);
+    activeThreads = calculateDynamicThreads(totalBytes);
+
+    const chunkSize = getDynamicChunkSize(totalBytes);
+    createChunks(totalBytes, chunkSize);
+
     startWorkers();
 }
-
 async function mergeChunks() {
     results.sort((a, b) => a.start - b.start);
     const blobs = results.map(r => r.data);
@@ -160,7 +197,13 @@ async function mergeChunks() {
             filename: "fragment_download.bin",
             saveAs: true
         });
-        isDownloading = false; 
+        isDownloading = false;
+        downloadCompleted = true;
+        
+        // Notify popup that download is complete
+        chrome.runtime.sendMessage({
+            action: "downloadComplete"
+        }).catch(() => {});
     };
     reader.readAsDataURL(finalBlob);
 }
@@ -216,6 +259,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ 
             isDownloading: isDownloading,
             isPaused: isPaused,
+            downloadCompleted: downloadCompleted,
             threads: activeThreads 
         });
 
