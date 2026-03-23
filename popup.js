@@ -10,9 +10,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const noThreadsMsg = document.getElementById('no-threads-msg');
     const actionBtn = document.getElementById('action-btn');
     const stopBtn = document.getElementById('stop-btn');
+    
+    // Swarm UI elements
+    const swarmCard = document.getElementById('swarm-card');
+    const peerCountBadge = document.getElementById('peer-count');
+    const swarmConnectedPeers = document.getElementById('swarm-connected-peers');
+    const swarmLocalChunks = document.getElementById('swarm-local-chunks');
+    const swarmTotalChunks = document.getElementById('swarm-total-chunks');
 
     let threadElements = {};
     let isPaused = false;
+    let swarmStatsInterval = null;
 
     // Handle Pause/Resume clicks
     actionBtn.addEventListener('click', () => {
@@ -35,6 +43,13 @@ document.addEventListener('DOMContentLoaded', () => {
         stopBtn.style.display = 'none';
         fileNameEl.innerText = "Download stopped";
         globalSpeedEl.innerText = "0 KB/s";
+        
+        // Stop swarm stats polling
+        if (swarmStatsInterval) {
+            clearInterval(swarmStatsInterval);
+            swarmStatsInterval = null;
+        }
+        swarmCard.style.display = 'none';
     });
 
     function setUIPaused() {
@@ -83,6 +98,61 @@ document.addEventListener('DOMContentLoaded', () => {
                 stats: document.getElementById(`thread-stats-${i}`)
             };
         }
+        
+        // ==================== SWARM: Start polling swarm stats ====================
+        startSwarmStatsPoll();
+    }
+    
+    // ==================== SWARM FUNCTIONS ====================
+    function startSwarmStatsPoll() {
+        if (swarmStatsInterval) clearInterval(swarmStatsInterval);
+        
+        // Poll swarm stats every 2 seconds
+        swarmStatsInterval = setInterval(() => {
+            chrome.runtime.sendMessage({ action: "getSwarmStats" }, (response) => {
+                if (!chrome.runtime.lastError && response) {
+                    updateSwarmUI(response);
+                }
+            });
+        }, 2000);
+        
+        // Fetch immediately
+        chrome.runtime.sendMessage({ action: "getSwarmStats" }, (response) => {
+            if (!chrome.runtime.lastError && response) {
+                updateSwarmUI(response);
+            }
+        });
+    }
+    
+    function updateSwarmUI(swarmStats) {
+        // Check if swarm is enabled
+        const swarmEnabled = swarmStats.swarmEnabled !== false;
+        
+        if (!swarmEnabled || swarmStats.connectedPeers === 0) {
+            // Hide swarm card if no peers connected
+            if (swarmStats.connectedPeers === 0) {
+                swarmCard.style.display = 'none';
+            }
+            return;
+        }
+        
+        // Show swarm card if peers are connected
+        swarmCard.style.display = 'block';
+        
+        // Update swarm stats
+        const connectedPeers = swarmStats.connectedPeers || 0;
+        const localChunks = swarmStats.localChunks || 0;
+        const totalChunks = swarmStats.totalChunksInSwarm || 0;
+        
+        peerCountBadge.innerText = `${connectedPeers} peer${connectedPeers !== 1 ? 's' : ''}`;
+        swarmConnectedPeers.innerText = connectedPeers;
+        swarmLocalChunks.innerText = localChunks;
+        swarmTotalChunks.innerText = totalChunks;
+        
+        // Change color based on network health
+        if (connectedPeers > 0) {
+            peerCountBadge.className = 'badge bg-success';
+        }
     }
 
     chrome.runtime.onMessage.addListener((message) => {
@@ -118,6 +188,13 @@ document.addEventListener('DOMContentLoaded', () => {
             globalProgress.style.width = "100%";
             globalPercentEl.innerText = "100%";
             globalSpeedEl.innerText = "0 KB/s";
+            
+            // Stop swarm stats polling
+            if (swarmStatsInterval) {
+                clearInterval(swarmStatsInterval);
+                swarmStatsInterval = null;
+            }
+            swarmCard.style.display = 'none';
         }
     });
 
@@ -136,6 +213,8 @@ document.addEventListener('DOMContentLoaded', () => {
                      isPaused = true;
                      setUIPaused();
                  }
+                 // Start swarm stats polling
+                 startSwarmStatsPoll();
             }
         }
     });

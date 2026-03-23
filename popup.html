@@ -68,6 +68,28 @@
                 <div class="text-center text-muted x-small py-2" id="no-threads-msg">No active tasks</div>
             </div>
         </div>
+
+        <!-- ==================== SWARM STATISTICS ====================  -->
+        <div class="card p-3 mt-3" id="swarm-card" style="display: none;">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <h6 class="m-0 small fw-bold text-secondary">🔗 P2P Swarm Network</h6>
+                <span class="badge bg-info" id="peer-count">0 peers</span>
+            </div>
+            <div class="x-small text-muted">
+                <div class="d-flex justify-content-between mb-1">
+                    <span>Connected Peers:</span>
+                    <span id="swarm-connected-peers" class="fw-bold text-info">0</span>
+                </div>
+                <div class="d-flex justify-content-between mb-1">
+                    <span>Local Chunks:</span>
+                    <span id="swarm-local-chunks" class="fw-bold text-success">0</span>
+                </div>
+                <div class="d-flex justify-content-between">
+                    <span>Network Chunks:</span>
+                    <span id="swarm-total-chunks" class="fw-bold text-primary">0</span>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="js/bootstrap.bundle.min.js"></script>
