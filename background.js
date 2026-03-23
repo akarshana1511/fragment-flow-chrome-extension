@@ -12,6 +12,101 @@ let isDownloading = false;
 let isPaused = false;
 let currentTargetUrl = "";
 
+// ==================== WRITE-AHEAD LOG (WAL) & CHECKPOINTING ====================
+// Persistent state manager for fault tolerance
+const CHECKPOINT_KEY = 'download_checkpoint_wal';
+const CHECKPOINT_INTERVAL = 1000; // Checkpoint every 1 second for high frequency persistence
+let lastCheckpointTime = 0;
+
+/**
+ * Save checkpoint to persistent storage (Write-Ahead Log)
+ * Writes the exact state needed to recover from any interruption
+ */
+async function saveCheckpoint() {
+    const now = Date.now();
+    
+    // Throttle checkpoint writes to avoid excessive storage operations
+    if (now - lastCheckpointTime < CHECKPOINT_INTERVAL) {
+        return;
+    }
+    lastCheckpointTime = now;
+
+    const checkpoint = {
+        timestamp: now,
+        url: currentTargetUrl,
+        globalTotalBytes: globalTotalBytes,
+        globalDownloadedBytes: globalDownloadedBytes,
+        chunkQueue: chunkQueue, // Remaining chunks to download
+        threadProgress: threadProgress, // Per-thread progress
+        isPaused: isPaused,
+        resultsMetadata: results.map(r => ({ start: r.start })) // Blob data not persisted
+    };
+
+    try {
+        await chrome.storage.local.set({ [CHECKPOINT_KEY]: checkpoint });
+    } catch (err) {
+        console.error('WAL checkpoint save failed:', err);
+    }
+}
+
+/**
+ * Restore checkpoint from persistent storage
+ * Called on extension load to resume interrupted downloads
+ */
+async function restoreCheckpoint() {
+    try {
+        const data = await chrome.storage.local.get(CHECKPOINT_KEY);
+        if (data[CHECKPOINT_KEY]) {
+            const checkpoint = data[CHECKPOINT_KEY];
+            const timeSinceSave = Date.now() - checkpoint.timestamp;
+
+            // Only restore if checkpoint was recent (within 1 hour)
+            if (timeSinceSave < 3600000) {
+                console.log(`[WAL] Restoring download checkpoint from ${timeSinceSave}ms ago`);
+                
+                currentTargetUrl = checkpoint.url;
+                globalTotalBytes = checkpoint.globalTotalBytes;
+                globalDownloadedBytes = checkpoint.globalDownloadedBytes;
+                chunkQueue = checkpoint.chunkQueue || [];
+                threadProgress = checkpoint.threadProgress || {};
+                isPaused = checkpoint.isPaused || false;
+                
+                // Resume the download if there are chunks remaining
+                if (chunkQueue.length > 0) {
+                    isDownloading = true;
+                    console.log(`[WAL] Resuming with ${chunkQueue.length} chunks remaining`);
+                    
+                    // Notify UI that download is in progress
+                    openCenteredPopup();
+                    
+                    // Resume download workers
+                    startWorkers();
+                }
+                
+                return true;
+            }
+        }
+    } catch (err) {
+        console.error('WAL checkpoint restore failed:', err);
+    }
+    return false;
+}
+
+/**
+ * Clear checkpoint after successful download completion
+ */
+async function clearCheckpoint() {
+    try {
+        await chrome.storage.local.remove(CHECKPOINT_KEY);
+        console.log('[WAL] Checkpoint cleared');
+    } catch (err) {
+        console.error('WAL checkpoint clear failed:', err);
+    }
+}
+
+// Restore checkpoint on extension load
+restoreCheckpoint();
+
 function createChunks(totalBytes, chunkSize = 2 * 1024 * 1024) {
     let start = 0;
     while (start < totalBytes) {
@@ -67,37 +162,68 @@ async function downloadWorker(url, id) {
             totalMB: chunkSize / (1024 * 1024)
         };
 
-        const response = await fetch(url, {
-            headers: { Range: `bytes=${chunk.start}-${chunk.end}` }
-        });
+        try {
+            const response = await fetch(url, {
+                headers: { Range: `bytes=${chunk.start}-${chunk.end}` }
+            });
 
-        const reader = response.body.getReader();
-        const chunks = [];
-        let downloaded = 0;
+            const reader = response.body.getReader();
+            const chunks = [];
+            let downloaded = 0;
 
-        while (true) {
-            if (isPaused) {
-                await reader.cancel(); // Abort the fetch stream immediately
-                break;
+            while (true) {
+                if (isPaused) {
+                    await reader.cancel(); // Abort the fetch stream immediately
+                    // Save checkpoint before breaking
+                    await saveCheckpoint();
+                    break;
+                }
+
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                chunks.push(value);
+                downloaded += value.length;
+                globalDownloadedBytes += value.length;
+                sessionDownloadedBytes += value.length;
+
+                threadProgress[id].percent = Math.round((downloaded / chunkSize) * 100);
+                threadProgress[id].downloadedMB = downloaded / (1024 * 1024);
+
+                broadcastProgress();
             }
 
-            const { done, value } = await reader.read();
-            if (done) break;
+            // Save whatever we managed to download
+            if (chunks.length > 0) {
+                const blob = new Blob(chunks);
+                results.push({ start: chunk.start, data: blob });
+                
+                // Save checkpoint after successful chunk completion (WAL)
+                await saveCheckpoint();
+            }
 
-            chunks.push(value);
-            downloaded += value.length;
-            globalDownloadedBytes += value.length;
-            sessionDownloadedBytes += value.length;
-
-            threadProgress[id].percent = Math.round((downloaded / chunkSize) * 100);
-            threadProgress[id].downloadedMB = downloaded / (1024 * 1024);
-
-            broadcastProgress();
+            // If we paused before finishing the chunk, put the remainder back in the queue
+            if (isPaused && downloaded < chunkSize) {
+                chunkQueue.unshift({
+                    start: chunk.start + downloaded,
+                    end: chunk.end
+                });
+                break;
+            }
+            
+            if (!isPaused) {
+                threadProgress[id].percent = 100;
+                broadcastProgress();
+            }
+        } catch (error) {
+            // Network error occurred - put chunk back in queue and save checkpoint
+            console.error(`[WAL] Network error for chunk ${id}:`, error);
+            chunkQueue.unshift(chunk); // Re-queue the failed chunk
+            await saveCheckpoint(); // Persist state before breaking
+            break; // Stop this worker, will retry on next resume
         }
-
-        // Save whatever we managed to download
-        if (chunks.length > 0) {
-            const blob = new Blob(chunks);
+    }
+}
             results.push({ start: chunk.start, data: blob });
         }
 
@@ -145,6 +271,10 @@ function initDownload(url, totalBytes) {
     globalTotalBytes = totalBytes;
 
     createChunks(totalBytes);
+    
+    // Clear old checkpoint before starting new download
+    clearCheckpoint();
+    
     startWorkers();
 }
 
@@ -154,13 +284,16 @@ async function mergeChunks() {
     const finalBlob = new Blob(blobs);
 
     const reader = new FileReader();
-    reader.onloadend = function () {
+    reader.onloadend = async function () {
         chrome.downloads.download({
             url: reader.result,
             filename: "fragment_download.bin",
             saveAs: true
         });
-        isDownloading = false; 
+        isDownloading = false;
+        
+        // Clear checkpoint after successful completion (WAL cleanup)
+        await clearCheckpoint();
     };
     reader.readAsDataURL(finalBlob);
 }
@@ -235,6 +368,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Handle UI controls
     if (message.action === "pause") {
         isPaused = true;
+        // Save checkpoint when paused (WAL)
+        saveCheckpoint();
     }
     if (message.action === "resume") {
         isPaused = false;
