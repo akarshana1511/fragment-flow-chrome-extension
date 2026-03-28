@@ -32,6 +32,11 @@
     .thread-row { padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
     .thread-row:last-child { border-bottom: none; }
     .x-small { font-size: 0.75rem; }
+    @keyframes pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.1); }
+        100% { transform: scale(1); }
+    }
 </style>
 </head>
 <body>
@@ -69,8 +74,27 @@
             </div>
         </div>
 
-        <!-- ==================== SWARM STATISTICS ====================  -->
-        <div class="card p-3 mt-3" id="swarm-card" style="display: none;">
+        <!-- ==================== BANDWIDTH & ADAPTIVE SETTINGS ====================  -->
+        <div class="card p-3 mt-3" id="bandwidth-card" style="display: none;">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <h6 class="m-0 small fw-bold text-secondary">📊 Network Performance</h6>
+                <span class="badge bg-info" id="bandwidth-badge">0 Mbps</span>
+            </div>
+            <div class="x-small text-muted">
+                <div class="d-flex justify-content-between mb-1">
+                    <span>Bandwidth:</span>
+                    <span id="bandwidth-value" class="fw-bold text-info">-- Mbps</span>
+                </div>
+                <div class="d-flex justify-content-between mb-1">
+                    <span>Adaptive Threads:</span>
+                    <span id="adaptive-threads" class="fw-bold text-success">--</span>
+                </div>
+                <div class="d-flex justify-content-between">
+                    <span>Chunk Size:</span>
+                    <span id="chunk-size" class="fw-bold text-primary">-- MB</span>
+                </div>
+            </div>
+        </div>
             <div class="d-flex justify-content-between align-items-center mb-2">
                 <h6 class="m-0 small fw-bold text-secondary">🔗 P2P Swarm Network</h6>
                 <span class="badge bg-info" id="peer-count">0 peers</span>

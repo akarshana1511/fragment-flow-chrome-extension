@@ -18,9 +18,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const swarmLocalChunks = document.getElementById('swarm-local-chunks');
     const swarmTotalChunks = document.getElementById('swarm-total-chunks');
 
+    // ==================== BANDWIDTH UI ELEMENTS ====================
+    const bandwidthCard = document.getElementById('bandwidth-card');
+    const bandwidthBadge = document.getElementById('bandwidth-badge');
+    const bandwidthValue = document.getElementById('bandwidth-value');
+    const adaptiveThreads = document.getElementById('adaptive-threads');
+    const chunkSize = document.getElementById('chunk-size');
+
     let threadElements = {};
     let isPaused = false;
     let swarmStatsInterval = null;
+    let uiInitialized = false; // Track if download UI has been initialized
 
     // Handle Pause/Resume clicks
     actionBtn.addEventListener('click', () => {
@@ -43,6 +51,7 @@ document.addEventListener('DOMContentLoaded', () => {
         stopBtn.style.display = 'none';
         fileNameEl.innerText = "Download stopped";
         globalSpeedEl.innerText = "0 KB/s";
+        uiInitialized = false; // Reset for next download
         
         // Stop swarm stats polling
         if (swarmStatsInterval) {
@@ -50,6 +59,7 @@ document.addEventListener('DOMContentLoaded', () => {
             swarmStatsInterval = null;
         }
         swarmCard.style.display = 'none';
+        bandwidthCard.style.display = 'none';
     });
 
     function setUIPaused() {
@@ -98,6 +108,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 stats: document.getElementById(`thread-stats-${i}`)
             };
         }
+        
+        uiInitialized = true;
         
         // ==================== SWARM: Start polling swarm stats ====================
         startSwarmStatsPoll();
@@ -157,15 +169,64 @@ document.addEventListener('DOMContentLoaded', () => {
 
     chrome.runtime.onMessage.addListener((message) => {
         if (message.action === "downloadInfo") {
-            if (message.supported) {
+            if (message.supported && !uiInitialized) {
                 initDownloadUI("Target File", parseFloat(message.sizeMB), message.threads);
             }
         } 
         else if (message.action === "updateProgress") {
+            // Auto-initialize UI if not already done (for fast initial broadcast)
+            if (!uiInitialized && message.globalTotalMB && message.activeThreads) {
+                initDownloadUI("Target File", parseFloat(message.globalTotalMB), message.activeThreads);
+            }
+
             globalProgress.style.width = `${message.globalPercent}%`;
             globalPercentEl.innerText = `${message.globalPercent}%`;
             globalSpeedEl.innerText = message.speed || "0 KB/s";
-            globalStatsEl.innerText = `${message.globalDownloadedMB.toFixed(2)} / ${message.globalTotalMB.toFixed(2)} MB`;
+            
+            // Display file size with proper formatting
+            const downloadedMB = parseFloat(message.globalDownloadedMB).toFixed(2);
+            const totalMB = typeof message.globalTotalMB === 'string' 
+                ? message.globalTotalMB 
+                : parseFloat(message.globalTotalMB).toFixed(2);
+            globalStatsEl.innerText = `${downloadedMB} / ${totalMB} MB`;
+
+            // ==================== BANDWIDTH DISPLAY ====================
+            if (message.bandwidth) {
+                bandwidthCard.style.display = 'block';
+                
+                if (message.bandwidth === "--") {
+                    bandwidthValue.innerText = "Measuring...";
+                    bandwidthBadge.innerText = "Measuring";
+                    bandwidthBadge.className = 'badge bg-secondary';
+                } else {
+                    const mbps = parseFloat(message.bandwidth);
+                    bandwidthValue.innerText = `${message.bandwidth} Mbps`;
+                    bandwidthBadge.innerText = `${message.bandwidth} Mbps`;
+                    
+                    // Update badge color based on bandwidth
+                    if (mbps < 5) {
+                        bandwidthBadge.className = 'badge bg-danger';
+                    } else if (mbps < 25) {
+                        bandwidthBadge.className = 'badge bg-warning';
+                    } else if (mbps < 100) {
+                        bandwidthBadge.className = 'badge bg-info';
+                    } else {
+                        bandwidthBadge.className = 'badge bg-success';
+                    }
+                }
+            }
+
+            // Update active thread count if changed
+            if (message.activeThreads) {
+                adaptiveThreads.innerText = message.activeThreads;
+                threadCountEl.innerText = message.activeThreads;
+            }
+
+            // Display chunk count if available
+            if (message.chunkCount !== undefined) {
+                // Can be used for debug info if needed
+                console.log(`Chunks remaining: ${message.chunkCount}`);
+            }
 
             if (message.threadsData) {
                 message.threadsData.forEach(thread => {
@@ -180,6 +241,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
             }
         }
+        else if (message.action === "threadCountUpdated") {
+            // Handle thread rebalancing notification
+            console.log(`Thread count updated to ${message.threads} (${message.bandwidth} Mbps)`);
+            adaptiveThreads.innerText = message.threads;
+            threadCountEl.innerText = message.threads;
+            
+            // Flash the badge to indicate change
+            threadCountEl.style.animation = 'none';
+            setTimeout(() => {
+                threadCountEl.style.animation = 'pulse 0.5s';
+            }, 10);
+        }
         else if (message.action === "downloadComplete") {
             statusBadge.innerText = "Downloaded";
             statusBadge.className = "badge bg-success text-white";
@@ -188,6 +261,12 @@ document.addEventListener('DOMContentLoaded', () => {
             globalProgress.style.width = "100%";
             globalPercentEl.innerText = "100%";
             globalSpeedEl.innerText = "0 KB/s";
+            uiInitialized = false; // Reset for next download
+            
+            // Display final file size
+            const totalMB = parseFloat(message.totalMB) || 0;
+            const downloadedMB = parseFloat(message.downloadedMB) || 0;
+            globalStatsEl.innerText = `${downloadedMB.toFixed(2)} / ${totalMB.toFixed(2)} MB`;
             
             // Stop swarm stats polling
             if (swarmStatsInterval) {
@@ -195,6 +274,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 swarmStatsInterval = null;
             }
             swarmCard.style.display = 'none';
+            bandwidthCard.style.display = 'none';
         }
     });
 

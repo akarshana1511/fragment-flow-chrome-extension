@@ -210,7 +210,6 @@ The swarm statistics card appears automatically when peers are connected:
 - **Cache location**: In-memory (session)
 - **Cache persistence**: Cleared on download completion
 - **Cache size**: Limited to downloaded chunks
-
 ## Security Considerations
 
 ### Local Network Security

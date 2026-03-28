@@ -92,6 +92,10 @@ async function restoreCheckpoint() {
                     isDownloading = true;
                     console.log(`[WAL] Resuming with ${chunkQueue.length} chunks remaining`);
                     
+                    // ==================== ADAPTIVE BANDWIDTH DETECTION ====================
+                    // Reset bandwidth detector for new session (pause/resume = new session)
+                    bandwidthDetector.reset();
+                    
                     // Notify UI that download is in progress
                     openCenteredPopup();
                     
@@ -123,8 +127,185 @@ async function clearCheckpoint() {
 }
 
 // Restore checkpoint on extension load
-restoreCheckpoint();
+let resumeAttempts = 0;
+const MAX_RESUME_ATTEMPTS = 3;
+
+async function attemptRestoreCheckpoint() {
+    resumeAttempts++;
+    if (resumeAttempts > MAX_RESUME_ATTEMPTS) {
+        console.warn('[WAL] Max resume attempts reached, clearing checkpoint');
+        await clearCheckpoint();
+        return false;
+    }
+    
+    return await restoreCheckpoint();
+}
+
+attemptRestoreCheckpoint();
+
+// ==================== ADAPTIVE BANDWIDTH DETECTION ====================
+/**
+ * BandwidthDetector - Measures real-time download speed
+ * Dynamically recommends thread count based on network conditions
+ */
+class BandwidthDetector {
+    constructor() {
+        this.measurements = [];
+        this.maxMeasurements = 10; // Keep rolling average of last 10 measurements
+        this.lastMeasurementTime = 0;
+        this.lastMeasuredBytes = 0;
+        this.measurementInterval = 2000; // Measure every 2 seconds
+    }
+
+    /**
+     * Record bandwidth measurement
+     * Returns the bandwidth in Mbps or null if measurement interval hasn't passed
+     */
+    recordMeasurement(totalBytesDownloaded, currentTime = Date.now()) {
+        const timeSinceLastMeasure = currentTime - this.lastMeasurementTime;
+        
+        // Only measure every measurementInterval ms to avoid noise
+        if (timeSinceLastMeasure < this.measurementInterval) {
+            return null;
+        }
+
+        const bytesDelta = totalBytesDownloaded - this.lastMeasuredBytes;
+        const seconds = timeSinceLastMeasure / 1000;
+        const mbps = (bytesDelta * 8) / (1_000_000 * seconds);
+
+        this.measurements.push(mbps);
+        if (this.measurements.length > this.maxMeasurements) {
+            this.measurements.shift();
+        }
+
+        this.lastMeasurementTime = currentTime;
+        this.lastMeasuredBytes = totalBytesDownloaded;
+
+        return mbps;
+    }
+
+    /**
+     * Get average bandwidth from recent measurements
+     */
+    getAverageBandwidth() {
+        if (this.measurements.length === 0) return 0;
+        const sum = this.measurements.reduce((a, b) => a + b, 0);
+        return sum / this.measurements.length;
+    }
+
+    /**
+     * Get current bandwidth (latest measurement)
+     */
+    getCurrentBandwidth() {
+        return this.measurements.length > 0 ? this.measurements[this.measurements.length - 1] : 0;
+    }
+
+    /**
+     * Recommend thread count based on bandwidth
+     * Ranges from 1 to 16 threads
+     */
+    recommendThreadCount(mbps = null) {
+        const bandwidth = mbps !== null ? mbps : this.getAverageBandwidth();
+
+        if (bandwidth < 5) return 2;        // Slow: minimal threads
+        if (bandwidth < 25) return 4;       // Medium: 4 threads
+        if (bandwidth < 100) return 8;      // Fast: 8 threads
+        return 16;                           // Very fast: 16 threads
+    }
+
+    /**
+     * Reset detector for new download
+     */
+    reset() {
+        this.measurements = [];
+        this.lastMeasurementTime = 0;
+        this.lastMeasuredBytes = 0;
+    }
+}
+
+/**
+ * DynamicChunkOptimizer - Combines file size + bandwidth for optimal chunking
+ * Ensures chunks are sized appropriately for network conditions
+ */
+class DynamicChunkOptimizer {
+    /**
+     * Calculate optimal chunk size based on file size and current bandwidth
+     * Chunk should complete in 2-5 seconds at current bandwidth for responsiveness
+     */
+    static getOptimalChunkSize(totalBytes, bandwidthMbps = 0) {
+        const MB = 1024 * 1024;
+        const sizeMB = totalBytes / MB;
+        let baseChunkSize;
+
+        // Base chunk size on file size
+        if (sizeMB < 50) {
+            baseChunkSize = 1 * MB;
+        } else if (sizeMB < 200) {
+            baseChunkSize = 2 * MB;
+        } else if (sizeMB < 1000) {
+            baseChunkSize = 4 * MB;
+        } else {
+            baseChunkSize = 8 * MB;
+        }
+
+        // If we have bandwidth info, adjust chunk size for 3-second download per chunk
+        if (bandwidthMbps > 0.1) {
+            // Target: chunk completes in 3 seconds
+            const targetBytes = (bandwidthMbps * 1_000_000 / 8) * 3;
+            // Use average of base size and bandwidth-based size for stability
+            baseChunkSize = (baseChunkSize + targetBytes) / 2;
+        }
+
+        // Clamp between reasonable limits
+        return Math.max(512 * 1024, Math.min(16 * MB, baseChunkSize));
+    }
+
+    /**
+     * Calculate optimal thread count considering BOTH file size AND bandwidth
+     * Combines both factors using a weighted average for optimal performance
+     * Returns { threads, reason }
+     */
+    static calculateOptimalThreads(totalBytes, bandwidthMbps = 0, fileSizeBased = null) {
+        const MB = 1024 * 1024;
+        const sizeMB = totalBytes / MB;
+
+        // ==================== FILE SIZE BASED CALCULATION ====================
+        let fileThreads = 1;
+        if (sizeMB < 5) {
+            fileThreads = 1;
+        } else if (sizeMB < 50) {
+            fileThreads = Math.min(4, Math.ceil(sizeMB / 15));
+        } else if (sizeMB < 200) {
+            fileThreads = Math.min(8, Math.ceil(sizeMB / 25));
+        } else {
+            fileThreads = Math.min(16, Math.ceil(sizeMB / 50));
+        }
+
+        let threads = fileThreads;
+        let reason = 'file-size-based';
+
+        // ==================== BANDWIDTH BASED CALCULATION ====================
+        if (bandwidthMbps > 0.1) {
+            const bandwidthDetector = new BandwidthDetector();
+            const bandwidthThreads = bandwidthDetector.recommendThreadCount(bandwidthMbps);
+            
+            // Combine both approaches: average them for balanced optimization
+            threads = Math.round((fileThreads + bandwidthThreads) / 2);
+            reason = `combined (${sizeMB.toFixed(0)}MB + ${bandwidthMbps.toFixed(1)} Mbps)`;
+        }
+
+        // Safety limits
+        threads = Math.max(1, Math.min(16, threads));
+
+        return { threads, reason };
+    }
+}
+
+// Initialize global bandwidth detector
+let bandwidthDetector = new BandwidthDetector();
+
 function calculateDynamicThreads(totalBytes) {
+    // First estimate: use file size
     const MB = 1024 * 1024;
     const sizeMB = totalBytes / MB;
 
@@ -148,13 +329,9 @@ function calculateDynamicThreads(totalBytes) {
 }
 
 function getDynamicChunkSize(totalBytes) {
-    const MB = 1024 * 1024;
-    const sizeMB = totalBytes / MB;
-
-    if (sizeMB < 50) return 1 * MB;
-    if (sizeMB < 200) return 2 * MB;
-    if (sizeMB < 1000) return 4 * MB;
-    return 8 * MB;
+    // Use bandwidth-aware optimizer if we have collected enough bandwidth data
+    const avgBandwidth = bandwidthDetector.getAverageBandwidth();
+    return DynamicChunkOptimizer.getOptimalChunkSize(totalBytes, avgBandwidth);
 }
 
 function createChunks(totalBytes, chunkSize = 2 * 1024 * 1024) {
@@ -163,6 +340,39 @@ function createChunks(totalBytes, chunkSize = 2 * 1024 * 1024) {
         let end = Math.min(start + chunkSize - 1, totalBytes - 1);
         chunkQueue.push({ start, end });
         start = end + 1;
+    }
+}
+
+/**
+ * Rebalance thread count based on current bandwidth
+ * Called periodically during download to adapt to network changes
+ */
+function rebalanceThreadCount() {
+    const currentBandwidth = bandwidthDetector.getAverageBandwidth();
+    if (currentBandwidth < 0.1) return; // Not enough data yet
+    
+    const { threads: recommendedThreads } = DynamicChunkOptimizer.calculateOptimalThreads(
+        globalTotalBytes,
+        currentBandwidth
+    );
+    
+    // Only rebalance if significant change (>20% difference)
+    const percentChange = Math.abs(recommendedThreads - activeThreads) / activeThreads;
+    if (percentChange > 0.2 && recommendedThreads !== activeThreads) {
+        const oldThreads = activeThreads;
+        activeThreads = recommendedThreads;
+        
+        console.log(
+            `[Bandwidth] Rebalancing threads: ${oldThreads} → ${activeThreads} ` +
+            `(Bandwidth: ${currentBandwidth.toFixed(2)} Mbps)`
+        );
+        
+        // Broadcast the thread change to UI
+        chrome.runtime.sendMessage({
+            action: "threadCountUpdated",
+            threads: activeThreads,
+            bandwidth: currentBandwidth.toFixed(2)
+        }).catch(() => {});
     }
 }
 
@@ -178,6 +388,14 @@ function broadcastProgress() {
     const elapsed = (now - startTime) / 1000;
     const speedBps = elapsed > 0 ? sessionDownloadedBytes / elapsed : 0;
     
+    // ==================== BANDWIDTH DETECTION ====================
+    // Measure bandwidth and rebalance threads if needed
+    const measuredMbps = bandwidthDetector.recordMeasurement(sessionDownloadedBytes, now);
+    if (measuredMbps !== null) {
+        console.log(`[Bandwidth] Measured: ${measuredMbps.toFixed(2)} Mbps, Avg: ${bandwidthDetector.getAverageBandwidth().toFixed(2)} Mbps`);
+        rebalanceThreadCount(); // Check if we should adjust threads
+    }
+    
     let speedText = `${(speedBps / 1024).toFixed(2)} KB/s`;
     if (speedBps > 1024 * 1024) {
         speedText = `${(speedBps / (1024 * 1024)).toFixed(2)} MB/s`;
@@ -192,123 +410,116 @@ function broadcastProgress() {
         totalMB: threadProgress[id].totalMB
     }));
 
+    const avgBandwidth = bandwidthDetector.getAverageBandwidth();
+
     chrome.runtime.sendMessage({
         action: "updateProgress",
         globalPercent: globalPercent,
         speed: speedText,
         globalDownloadedMB: globalDownloadedBytes / (1024 * 1024),
         globalTotalMB: globalTotalBytes / (1024 * 1024),
-        threadsData: threadsData
+        threadsData: threadsData,
+        bandwidth: avgBandwidth > 0 ? avgBandwidth.toFixed(2) : "--",
+        activeThreads: activeThreads,
+        chunkCount: chunkQueue.length
     }).catch(() => {}); 
 }
 
 async function downloadWorker(url, id) {
-    while (chunkQueue.length > 0) {
-        if (isPaused) break;
+    let retryCount = 0;
 
+    while (true) {
+        if (isPaused || !isDownloading) break;
+
+        // 🔹 Get next chunk
         const chunk = chunkQueue.shift();
         if (!chunk) break;
 
         const chunkSize = chunk.end - chunk.start + 1;
-        const chunkKey = `${chunk.start}-${chunk.end}`; // Cache key for swarm
-        
+
         threadProgress[id] = {
             percent: 0,
             downloadedMB: 0,
             totalMB: chunkSize / (1024 * 1024),
-            source: 'server' // Track where chunk comes from
+            source: 'server'
         };
 
+        let downloaded = 0;
+
         try {
-            let blob = null;
-            let fromPeer = false;
+            // 🔥 Keep fetching continuously (connection reuse benefit)
+            const response = await fetch(url, {
+                headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
+                signal: AbortSignal.timeout(30000)
+            });
 
-            // ==================== SWARM: Try peer first ====================
-            if (swarmEnabled && Object.keys(peers).length > 0) {
-                try {
-                    console.log(`[SWARM] Attempting to get chunk ${chunkKey} from peer...`);
-                    blob = await requestChunkFromPeer(chunkKey);
-                    fromPeer = true;
-                    threadProgress[id].source = 'peer';
-                    console.log(`[SWARM] Successfully retrieved chunk ${chunkKey} from peer!`);
-                } catch (peerError) {
-                    console.log(`[SWARM] Peer fetch failed, fallback to server: ${peerError.message}`);
-                    blob = null; // Fall back to server
-                }
+            if (!response.ok && response.status !== 206) {
+                throw new Error(`HTTP ${response.status}`);
             }
 
-            // ==================== FALLBACK: Download from server ====================
-            if (!blob) {
-                const response = await fetch(url, {
-                    headers: { Range: `bytes=${chunk.start}-${chunk.end}` }
-                });
+            const reader = response.body.getReader();
+            const chunks = [];
 
-                const reader = response.body.getReader();
-                const chunks = [];
-                let downloaded = 0;
+            while (true) {
+                if (isPaused || !isDownloading) {
+                    await reader.cancel();
+                    await saveCheckpoint();
 
-                while (true) {
-                    if (isPaused) {
-                        await reader.cancel(); // Abort the fetch stream immediately
-                        await saveCheckpoint();
-                        break;
-                    }
-
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    chunks.push(value);
-                    downloaded += value.length;
-                    globalDownloadedBytes += value.length;
-                    sessionDownloadedBytes += value.length;
-
-                    threadProgress[id].percent = Math.round((downloaded / chunkSize) * 100);
-                    threadProgress[id].downloadedMB = downloaded / (1024 * 1024);
-
-                    broadcastProgress();
+                    // 🔁 Put remaining back
+                    chunkQueue.unshift({
+                        start: chunk.start + downloaded,
+                        end: chunk.end
+                    });
+                    return;
                 }
 
-                if (chunks.length > 0) {
-                    blob = new Blob(chunks);
-                    threadProgress[id].source = 'server';
-                }
-            }
+                const { done, value } = await reader.read();
+                if (done) break;
 
-            // Save whatever we managed to download
-            if (blob) {
-                results.push({ start: chunk.start, data: blob });
-                
-                // ==================== SWARM: Cache chunk for peer sharing ====================
-                if (swarmEnabled) {
-                    cacheChunkLocally(chunkKey, blob);
-                }
-                
-                // Save checkpoint after successful chunk completion (WAL)
-                await saveCheckpoint();
-                
-                threadProgress[id].percent = 100;
-                threadProgress[id].downloadedMB = chunkSize / (1024 * 1024);
-            }
+                chunks.push(value);
+                downloaded += value.length;
 
-            // If we paused before finishing the chunk, put the remainder back in the queue
-            if (isPaused && !blob) {
-                chunkQueue.unshift({
-                    start: chunk.start + downloaded,
-                    end: chunk.end
-                });
-                break;
-            }
-            
-            if (!isPaused && blob) {
-                threadProgress[id].percent = 100;
+                globalDownloadedBytes += value.length;
+                sessionDownloadedBytes += value.length;
+
+                threadProgress[id].percent = Math.round((downloaded / chunkSize) * 100);
+                threadProgress[id].downloadedMB = downloaded / (1024 * 1024);
+
                 broadcastProgress();
             }
-        } catch (error) {
-            // Network error occurred - put chunk back in queue and save checkpoint
-            console.error(`[Download] Network error for chunk ${id}:`, error);
-            chunkQueue.unshift(chunk); // Re-queue the failed chunk
-            await saveCheckpoint(); // Persist state before breaking
-            break; // Stop this worker, will retry on next resume
+
+            // ✅ Save chunk
+            const blob = new Blob(chunks);
+            results.push({ start: chunk.start, data: blob });
+
+            threadProgress[id].percent = 100;
+
+            await saveCheckpoint();
+
+            retryCount = 0; // reset retry after success
+
+        } catch (err) {
+            console.warn(`[Worker ${id}] Error:`, err.message);
+
+            // 🔁 Retry with exponential backoff
+            retryCount++;
+            const delay = Math.min(2000 * Math.pow(2, retryCount), 15000);
+
+            // Requeue chunk
+            chunkQueue.unshift({
+                start: chunk.start + downloaded,
+                end: chunk.end
+            });
+
+            await saveCheckpoint();
+
+            await new Promise(res => setTimeout(res, delay));
+
+            // ❌ Too many retries → exit worker
+            if (retryCount > 5) {
+                console.error(`[Worker ${id}] Too many retries, stopping`);
+                return;
+            }
         }
     }
 }
@@ -342,6 +553,10 @@ function initDownload(url, totalBytes) {
     globalTotalBytes = totalBytes;
     lastProgressBroadcastTime = 0;
     
+    // ==================== ADAPTIVE BANDWIDTH DETECTION ====================
+    // Reset bandwidth detector for new download
+    bandwidthDetector.reset();
+    
     // Clear any existing broadcast timeouts
     if (broadcastTimeoutId) {
         clearTimeout(broadcastTimeoutId);
@@ -351,9 +566,14 @@ function initDownload(url, totalBytes) {
     // Clear old checkpoint before starting new download (WAL)
     clearCheckpoint();
 
+    // Initial thread count based on file size (will be adjusted by bandwidth detection)
     activeThreads = calculateDynamicThreads(totalBytes);
+    console.log(`[Init] Starting with ${activeThreads} threads for ${(totalBytes / (1024 * 1024)).toFixed(2)} MB file`);
 
+    // Chunk size optimized for file size (will adapt as bandwidth is measured)
     const chunkSize = getDynamicChunkSize(totalBytes);
+    console.log(`[Init] Using chunk size: ${(chunkSize / (1024 * 1024)).toFixed(2)} MB`);
+    
     createChunks(totalBytes, chunkSize);
 
     // ==================== SWARM: Initialize P2P swarm ====================
@@ -361,6 +581,20 @@ function initDownload(url, totalBytes) {
         initializeSwarm(url);
         console.log('[SWARM] P2P swarm initialized for distributed downloading');
     }
+
+    // ==================== BROADCAST INITIAL STATE ====================
+    // Send initial progress update so UI shows correct file size from the start
+    const initialPercent = globalTotalBytes > 0 ? Math.round((0 / globalTotalBytes) * 100) : 0;
+    chrome.runtime.sendMessage({
+        action: "updateProgress",
+        globalPercent: initialPercent,
+        speed: "0 KB/s",
+        globalDownloadedMB: 0,
+        globalTotalMB: (globalTotalBytes / (1024 * 1024)).toFixed(2),
+        threadsData: [],
+        bandwidth: null,
+        activeThreads: activeThreads
+    }).catch(() => {});
 
     startWorkers();
 }
@@ -386,6 +620,7 @@ async function mergeChunks() {
         
         // Clear checkpoint after successful completion (WAL cleanup)
         await clearCheckpoint();
+        resumeAttempts = 0; // Reset resume counter on successful completion
         
         // Clear any pending timeouts
         if (broadcastTimeoutId) {
@@ -395,7 +630,9 @@ async function mergeChunks() {
         
         // Notify popup that download is complete
         chrome.runtime.sendMessage({
-            action: "downloadComplete"
+            action: "downloadComplete",
+            totalMB: (globalTotalBytes / (1024 * 1024)).toFixed(2),
+            downloadedMB: (globalDownloadedBytes / (1024 * 1024)).toFixed(2)
         }).catch(() => {});
         
         // Reset state after a delay
